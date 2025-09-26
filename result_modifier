@@ -1,0 +1,489 @@
+<? if (!defined('B_PROLOG_INCLUDED') || B_PROLOG_INCLUDED !== true) die();
+
+/**
+ * @var array $arParams
+ * @var array $arResult
+ */
+
+use Bitrix\Main\Data\Cache;
+use Bitrix\Highloadblock as HL;
+use Bitrix\Main\Entity;
+
+/**
+ * @param int $iblockId
+ * @param int $sectionId
+ * @param int $cacheTime
+ * @param string $html
+ * @return array
+ */
+
+
+/**
+ * Получает список активных дочерних разделов с кэшированием
+ */
+function getChildSections(int $iblockId, int $sectionId): array
+{
+    if ($sectionId <= 0) {
+        return [];
+    }
+
+    $arChildSections = [];
+    $rsSections = CIBlockSection::GetList(
+        [
+            'SORT' => 'ASC',
+            'ID' => 'ASC'
+        ],
+        [
+            'IBLOCK_ID' => $iblockId,
+            'SECTION_ID' => $sectionId,
+            'ACTIVE' => 'Y',
+            'GLOBAL_ACTIVE' => 'Y'
+        ],
+        false,
+        ['ID', 'NAME', 'SECTION_PAGE_URL']
+    );
+
+    while ($arSection = $rsSections->GetNext()) {
+        $arChildSections[] = $arSection;
+    }
+
+    return $arChildSections;
+}
+
+/**
+ * Получает элементы HL-блока по ID с кэшированием
+ */
+function getHlItems(int $hlblockId, array $ids): array
+{
+    if (empty($ids)) {
+        return [];
+    }
+
+    $hlblock = HL\HighloadBlockTable::getById($hlblockId)->fetch();
+    if (!$hlblock) {
+        return [];
+    }
+
+    $entity = HL\HighloadBlockTable::compileEntity($hlblock);
+    $entityClass = $entity->getDataClass();
+
+    // Собираем список полей динамически
+    $fields = array_keys($entity->getFields());
+
+    $res = $entityClass::getList([
+        'select' => $fields,
+        'filter' => ['ID' => $ids],
+    ]);
+
+    $rawItems = [];
+    while ($row = $res->fetch()) {
+        // Если среди полей есть файловые — подставим SRC
+        foreach ($row as $fieldCode => $value) {
+            if (is_numeric($value) && strpos($fieldCode, 'UF_') === 0) {
+                $file = CFile::GetFileArray($value);
+                if (!empty($file['SRC'])) {
+                    $row[$fieldCode . '_SRC'] = $file['SRC'];
+                }
+            }
+        }
+        $rawItems[$row['ID']] = $row;
+    }
+
+    // Сохраняем порядок как в исходном массиве $ids
+    $arHlItems = [];
+    foreach ($ids as $id) {
+        if (isset($rawItems[$id])) {
+            $arHlItems[] = $rawItems[$id];
+        }
+    }
+
+    return $arHlItems;
+}
+
+/**
+ * Получает элементы До/После по текущему разделу
+ */
+function getAfterBeforeItemsBySection(int $sectionId): array
+{
+    if (!$sectionId) {
+        return [];
+    }
+
+    $res = CIBlockElement::GetList(
+        [],
+        [
+            'IBLOCK_ID' => 13, // ИБ До/После
+            'ACTIVE' => 'Y',
+            'PROPERTY_SERVICES' => $sectionId // фильтруем по привязке к текущему разделу
+        ],
+        false,
+        false,
+        ['ID', 'NAME', 'PREVIEW_PICTURE', 'PROPERTY_SERVICES']
+    );
+
+    $arItems = [];
+    while ($arItem = $res->Fetch()) {
+        if (!empty($arItem['PREVIEW_PICTURE'])) {
+            $file = CFile::GetFileArray($arItem['PREVIEW_PICTURE']);
+            if (!empty($file['SRC'])) {
+                $arItem['PREVIEW_PICTURE_SRC'] = $file['SRC'];
+            }
+        }
+
+        // Проверка, что текущий раздел есть в списке SERVICES (на случай множественного значения)
+        if (!empty($arItem['PROPERTY_SERVICES_VALUE']) && is_array($arItem['PROPERTY_SERVICES_VALUE'])) {
+            if (in_array($sectionId, $arItem['PROPERTY_SERVICES_VALUE'])) {
+                $arItems[] = $arItem;
+            }
+        } elseif ((int)$arItem['PROPERTY_SERVICES_VALUE'] === $sectionId) {
+            $arItems[] = $arItem;
+        }
+    }
+
+    return $arItems;
+}
+
+/**
+ * Конвертирует HTML-таблицу в массив
+ */
+function _normalizeTableHtml($value): string
+{
+    if (is_array($value)) {
+        if (!empty($value['~TEXT'])) $value = $value['~TEXT'];
+        elseif (!empty($value['TEXT'])) $value = $value['TEXT'];
+        elseif (!empty($value['~VALUE'])) $value = $value['~VALUE'];
+        elseif (!empty($value['VALUE'])) $value = $value['VALUE'];
+        else $value = '';
+    }
+
+    $html = (string)$value;
+
+    // Если таблица пришла как &lt;table&gt;..., декодируем сущности
+    if (strpos($html, '&lt;') !== false || strpos($html, '&amp;lt;') !== false) {
+        $html = html_entity_decode($html, ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML5, 'UTF-8');
+    }
+
+    $html = trim($html);
+    // Оставляем только первую таблицу, если их вдруг несколько
+    if (preg_match('~<table\b.*?>.*?</table>~is', $html, $m)) {
+        return $m[0];
+    }
+
+    return $html;
+}
+
+/**
+ * Парсим таблицу через DOMDocument
+ */
+function _parseTableDom(string $tableHtml): array
+{
+    $out = ['title' => '', 'head' => [], 'rows' => []];
+    if ($tableHtml === '') return $out;
+
+    libxml_use_internal_errors(true);
+
+    $doc = new DOMDocument();
+    // Оборачиваем в полноценный HTML, чтобы XPath работал стабильно
+    $wrapped = '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>' . $tableHtml . '</body></html>';
+    // Для старых PHP надёжнее перегнать в HTML-entities
+    $doc->loadHTML(mb_convert_encoding($wrapped, 'HTML-ENTITIES', 'UTF-8'));
+
+    $xpath = new DOMXPath($doc);
+
+    // Берём только первую таблицу
+    $tbl = $xpath->query('//table')->item(0);
+    if (!$tbl) return $out;
+
+    // caption
+    $cap = $xpath->query('.//caption', $tbl)->item(0);
+    if ($cap) $out['title'] = trim($cap->textContent);
+
+    // head: либо явные th, либо первая строка
+    $ths = $xpath->query('.//tr[th][1]/th', $tbl);
+    if ($ths->length > 0) {
+        foreach ($ths as $th) $out['head'][] = trim($th->textContent);
+    }
+
+    // body rows: все строки с td
+    foreach ($xpath->query('.//tr[td]', $tbl) as $tr) {
+        $row = [];
+        foreach ($xpath->query('.//td', $tr) as $td) {
+            // Сохраняем переносы строк из <br>, если есть
+            $cellHtml = $doc->saveHTML($td);
+            $cellHtml = preg_replace('~^<td[^>]*>|</td>$~i', '', $cellHtml);
+            $cellHtml = str_ireplace(['<br>', '<br/>', '<br />'], "\n", $cellHtml);
+            $row[] = trim(strip_tags($cellHtml));
+        }
+        if ($row) $out['rows'][] = $row;
+    }
+
+    return $out;
+}
+
+/**
+ * Фоллбэк парсера (если DOM не дал строк — разбираем грубо через regex)
+ */
+function _parseTableFallback(string $tableHtml): array
+{
+    $out = ['title' => '', 'head' => [], 'rows' => []];
+    if ($tableHtml === '') return $out;
+
+    if (preg_match('~<caption[^>]*>(.*?)</caption>~is', $tableHtml, $m)) {
+        $out['title'] = trim(strip_tags($m[1]));
+    }
+
+    // Все строки
+    if (preg_match_all('~<tr[^>]*>(.*?)</tr>~is', $tableHtml, $trs)) {
+        $firstIsHead = false;
+        foreach ($trs[1] as $i => $trHtml) {
+            if (preg_match_all('~<th[^>]*>(.*?)</th>~is', $trHtml, $ths) && !$firstIsHead) {
+                foreach ($ths[1] as $th) $out['head'][] = trim(strip_tags($th));
+                $firstIsHead = true;
+                continue;
+            }
+            if (preg_match_all('~<td[^>]*>(.*?)</td>~is', $trHtml, $tds)) {
+                $row = [];
+                foreach ($tds[1] as $tdHtml) {
+                    $tdHtml = str_ireplace(['<br>', '<br/>', '<br />'], "\n", $tdHtml);
+                    $row[] = trim(strip_tags($tdHtml));
+                }
+                if ($row) $out['rows'][] = $row;
+            }
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * Собираем HTML div-таблицы из разобранных данных
+ */
+function _renderDivTable(array $data): string
+{
+    if (empty($data['head']) && empty($data['rows'])) return '';
+
+    ob_start(); ?>
+    <div class="serv-danger__table">
+        <?php if (!empty($data['title'])): ?>
+            <div class="serv-danger__table-title"><?= htmlspecialchars($data['title']) ?></div>
+        <?php endif; ?>
+
+        <?php if (!empty($data['head'])): ?>
+            <div class="serv-danger__table-head">
+                <?php foreach ($data['head'] as $h): ?>
+                    <div class="serv-danger__table-head-item"><?= htmlspecialchars($h) ?></div>
+                <?php endforeach; ?>
+            </div>
+        <?php endif; ?>
+
+        <?php if (!empty($data['rows'])): ?>
+            <div class="serv-danger__table-body">
+                <?php foreach ($data['rows'] as $row): ?>
+                    <div class="serv-danger__table-body-row">
+                        <?php foreach ($row as $cell): ?>
+                            <div class="serv-danger__table-body-row-item"><?= nl2br(htmlspecialchars($cell)) ?></div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+        <?php endif; ?>
+    </div>
+    <?php
+    return ob_get_clean();
+}
+
+/**
+ * Главная функция: берёт значение свойства (строка/массив), парсит и возвращает готовую div-вёрстку
+ */
+function convertHtmlTableToDivsSafe($propValue): string
+{
+    $tableHtml = _normalizeTableHtml($propValue);
+    if ($tableHtml === '' || stripos($tableHtml, '<table') === false) return '';
+
+    $data = _parseTableDom($tableHtml);
+
+    // Если по каким-то причинам DOM не нашёл строки — пробуем фоллбэк
+    if (empty($data['rows'])) {
+        $data = _parseTableFallback($tableHtml);
+    }
+
+    return _renderDivTable($data);
+}
+
+/**
+ * Получает элементы Отзывов
+ */
+function getReviewsByIds(array $ids): array
+{
+    if (empty($ids)) {
+        return [];
+    }
+
+    $items = [];
+
+    $res = CIBlockElement::GetList(
+        [],
+        ['ID' => $ids, 'ACTIVE' => 'Y'],
+        false,
+        false,
+        ['ID', 'NAME', 'PREVIEW_TEXT', 'DETAIL_TEXT', 'DATE_CREATE']
+    );
+
+    while ($arItem = $res->Fetch()) {
+        $name = trim($arItem['NAME']);
+
+        $items[$arItem['ID']] = [
+            'ID'           => $arItem['ID'],
+            'NAME'         => $name,
+            'FIRST_LETTER' => mb_substr($name, 0, 1),
+            'TEXT'         => !empty($arItem['PREVIEW_TEXT']) ? $arItem['PREVIEW_TEXT'] : $arItem['DETAIL_TEXT'],
+            'DATE'         => FormatDate('d.m.Y', MakeTimeStamp($arItem['DATE_CREATE'])),
+        ];
+    }
+
+    // сохраняем порядок как в исходном массиве ID
+    $ordered = [];
+    foreach ($ids as $id) {
+        if (isset($items[$id])) {
+            $ordered[] = $items[$id];
+        }
+    }
+
+    return $ordered;
+}
+
+/**
+ * Получает Врачей и Клиники
+ */
+function getDoctorsAndClinics(int $sectionId, string $iblockCode = 'doctors'): array
+{
+    $result = [
+        'DOCTORS' => [],
+        'CLINICS' => []
+    ];
+
+    if ($sectionId <= 0) {
+        return $result;
+    }
+
+    $doctors = [];
+    $clinicIds = [];
+
+    $res = CIBlockElement::GetList(
+        [],
+        [
+            "IBLOCK_CODE"       => $iblockCode,
+            "ACTIVE"            => "Y",
+            "PROPERTY_SERVICES" => $sectionId
+        ],
+        false,
+        false,
+        [
+            "ID",
+            "IBLOCK_ID",
+            "NAME",
+            "CODE",
+            "PREVIEW_PICTURE",
+            "PROPERTY_WORK_STATUS",
+            "PROPERTY_PLACE_WHERE_CAN_HELP"
+        ]
+    );
+
+    while ($arItem = $res->GetNext()) {
+        $arItem["PREVIEW_PICTURE"] = $arItem["PREVIEW_PICTURE"]
+            ? CFile::GetFileArray($arItem["PREVIEW_PICTURE"])
+            : null;
+
+        $arItem["WORK_STATUS"] = $arItem["PROPERTY_WORK_STATUS_VALUE"] ?? "";
+        $arItem["CLINICS"] = (array)($arItem["PROPERTY_PLACE_WHERE_CAN_HELP_VALUE"] ?? []);
+
+        $clinicIds = array_merge($clinicIds, $arItem["CLINICS"]);
+
+        $doctors[] = $arItem;
+    }
+
+    $clinicIds = array_unique(array_filter($clinicIds));
+    $clinics = [];
+
+    if (!empty($clinicIds)) {
+        $res = CIBlockElement::GetList(
+            ["SORT" => "ASC"],
+            ["ID" => $clinicIds, "ACTIVE" => "Y"],
+            false,
+            false,
+            ["ID", "NAME"]
+        );
+
+        while ($arClinic = $res->Fetch()) {
+            $clinics[] = $arClinic;
+        }
+    }
+
+    shuffle($doctors);
+
+    $result['DOCTORS'] = $doctors;
+    $result['CLINICS'] = $clinics;
+
+    return $result;
+}
+
+
+// Инитаем функцию для получения дочерних разделов
+$arResult['CHILD_SECTIONS'] = getChildSections(
+    (int)$arParams['IBLOCK_ID'],
+    (int)$arResult['ID']
+);
+
+
+// Элементы Главное о процедуре
+$hlBlockId = 10;
+$arHlIds = (array)$arResult['UF_BLOCK_MAIN_ABOUT_PROC'];
+$arResult['MAIN_ABOUT_PROCEDURE'] = getHlItems($hlBlockId, $arHlIds);
+
+
+// Элементы До/После
+$sectionId = (int)$arResult['ID'];
+$arResult['AFTER_BEFORE_ITEMS'] = getAfterBeforeItemsBySection($sectionId);
+
+
+// Таблица
+$arResult['TABLE_HTML'] = convertHtmlTableToDivsSafe($arResult['UF_BLOCK_TABLE']);
+
+
+// Элементы Отзывов
+$reviewIds = (array)$arResult['UF_BLOCK_REVIEWS'] ;
+$arResult['REVIEWS'] = getReviewsByIds($reviewIds);
+
+
+// Эленменты Врачей и клиник
+$sectionId = (int)$arResult['ID'];
+$doctorsData = getDoctorsAndClinics($sectionId);
+$arResult['DOCTORS'] = $doctorsData['DOCTORS'];
+$arResult['CLINICS'] = $doctorsData['CLINICS'];
+
+$after_items = $arResult['UF_AFTER_BEFORE'];
+unset($arResult['UF_AFTER_BEFORE']);
+foreach($after_items as $item){
+    $elementID = $item; // ID вашего элемента
+    $res = CIBlockElement::GetByID($elementID);
+
+    if($ob = $res->GetNextElement())
+    {
+        $arFields = $ob->GetFields(); // Получаем поля элемента
+        $arProps = $ob->GetProperties(); // Получаем свойства элемента
+        if ($arFields["ACTIVE"] === "Y") {
+            $arFields['PREVIEW_PICTURE'] = CFile::GetFileArray($arFields['PREVIEW_PICTURE'])['SRC'];
+            $arResult['UF_AFTER_BEFORE'][$item]['FIELDS'] = $arFields;
+            $arResult['UF_AFTER_BEFORE'][$item]['PROPS'] = $arProps;
+        }
+    }
+
+}
+
+
+// Передача массива с акциями в component_epilog
+$cp = $this->__component;
+if (is_object($cp)) {
+    $cp->arResult['STOCK'] = $arResult['UF_BLOCK_STOCK'];
+    $this->__component->SetResultCacheKeys(['STOCK']);
+}
