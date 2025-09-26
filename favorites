@@ -1,0 +1,109 @@
+<?php
+
+use Bitrix\Main\Loader;
+use Bitrix\Highloadblock as HL;
+
+Loader::includeModule("highloadblock");
+
+function getFavoritesEntity()
+{
+    static $entityClass = null;
+
+    if ($entityClass === null) {
+        $hlblock = HL\HighloadBlockTable::getList([
+            'filter' => ['=NAME' => 'Favorites']
+        ])->fetch();
+
+        if (!$hlblock) {
+            throw new \Exception('Favorites HL-блок не найден');
+        }
+
+        $entity = HL\HighloadBlockTable::compileEntity($hlblock);
+        $entityClass = $entity->getDataClass();
+    }
+
+    return $entityClass;
+}
+
+function addFavorite($userId, $productId)
+{
+    $entity = getFavoritesEntity();
+    $existing = $entity::getList([
+        'filter' => ['UF_USER_ID' => $userId, 'UF_PRODUCT_ID' => $productId],
+        'select' => ['ID'],
+        'limit'  => 1
+    ])->fetch();
+
+    if (!$existing) {
+        $entity::add([
+            'UF_USER_ID' => $userId,
+            'UF_PRODUCT_ID' => $productId,
+        ]);
+    }
+}
+
+function removeFavorite($userId, $productId)
+{
+    $entity = getFavoritesEntity();
+    $row = $entity::getList([
+        'filter' => ['UF_USER_ID' => $userId, 'UF_PRODUCT_ID' => $productId],
+        'select' => ['ID'],
+        'limit'  => 1
+    ])->fetch();
+
+    if ($row) {
+        $entity::delete($row['ID']);
+    }
+}
+
+function isFavorite($userId, $productId): bool
+{
+    $entity = getFavoritesEntity();
+    return (bool)$entity::getList([
+        'filter' => ['UF_USER_ID' => $userId, 'UF_PRODUCT_ID' => $productId],
+        'select' => ['ID'],
+        'limit'  => 1
+    ])->fetch();
+}
+
+function getUserFavorites($userId): array
+{
+    static $cache = [];
+
+    if (isset($cache[$userId])) {
+        return $cache[$userId];
+    }
+
+    $entity = getFavoritesEntity();
+
+    $result = $entity::getList([
+        'filter' => ['UF_USER_ID' => $userId],
+        'select' => ['UF_PRODUCT_ID']
+    ]);
+
+    $ids = [];
+    while ($row = $result->fetch()) {
+        $ids[] = $row['UF_PRODUCT_ID'];
+    }
+
+    $cache[$userId] = $ids;
+    return $ids;
+}
+
+function getUserFavoritesCount($userId): int
+{
+    static $countCache = [];
+
+    if (isset($countCache[$userId])) {
+        return $countCache[$userId];
+    }
+
+    $entity = getFavoritesEntity();
+
+    $count = $entity::getCount([
+        'UF_USER_ID' => $userId
+    ]);
+
+    $countCache[$userId] = $count;
+    return $count;
+}
